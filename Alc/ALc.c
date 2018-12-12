@@ -1165,75 +1165,6 @@ static void alc_initconfig(void)
 }
 #define DO_INITCONFIG() alcall_once(&alc_config_once, alc_initconfig)
 
-#ifdef __ANDROID__
-#include <jni.h>
-
-static JavaVM *gJavaVM;
-static pthread_key_t gJVMThreadKey;
-
-static void CleanupJNIEnv(void* UNUSED(ptr))
-{
-    JCALL0(gJavaVM,DetachCurrentThread)();
-}
-
-void *Android_GetJNIEnv(void)
-{
-    if(!gJavaVM)
-    {
-        WARN("gJavaVM is NULL!\n");
-        return NULL;
-    }
-
-    /* http://developer.android.com/guide/practices/jni.html
-     *
-     * All threads are Linux threads, scheduled by the kernel. They're usually
-     * started from managed code (using Thread.start), but they can also be
-     * created elsewhere and then attached to the JavaVM. For example, a thread
-     * started with pthread_create can be attached with the JNI
-     * AttachCurrentThread or AttachCurrentThreadAsDaemon functions. Until a
-     * thread is attached, it has no JNIEnv, and cannot make JNI calls.
-     * Attaching a natively-created thread causes a java.lang.Thread object to
-     * be constructed and added to the "main" ThreadGroup, making it visible to
-     * the debugger. Calling AttachCurrentThread on an already-attached thread
-     * is a no-op.
-     */
-    JNIEnv *env = pthread_getspecific(gJVMThreadKey);
-    if(!env)
-    {
-        int status = JCALL(gJavaVM,AttachCurrentThread)(&env, NULL);
-        if(status < 0)
-        {
-            ERR("Failed to attach current thread\n");
-            return NULL;
-        }
-        pthread_setspecific(gJVMThreadKey, env);
-    }
-    return env;
-}
-
-/* Automatically called by JNI. */
-JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *jvm, void* UNUSED(reserved))
-{
-    void *env;
-    int err;
-
-    gJavaVM = jvm;
-    if(JCALL(gJavaVM,GetEnv)(&env, JNI_VERSION_1_4) != JNI_OK)
-    {
-        ERR("Failed to get JNIEnv with JNI_VERSION_1_4\n");
-        return JNI_ERR;
-    }
-
-    /* Create gJVMThreadKey so we can keep track of the JNIEnv assigned to each
-     * thread. The JNIEnv *must* be detached before the thread is destroyed.
-     */
-    if((err=pthread_key_create(&gJVMThreadKey, CleanupJNIEnv)) != 0)
-        ERR("pthread_key_create failed: %d\n", err);
-    pthread_setspecific(gJVMThreadKey, env);
-    return JNI_VERSION_1_4;
-}
-#endif
-
 
 /************************************************
  * Library deinitialization
@@ -1735,7 +1666,7 @@ static ALCenum UpdateDeviceParams(ALCdevice *device, const ALCint *attrList)
 {
     enum HrtfRequestMode hrtf_userreq = Hrtf_Default;
     enum HrtfRequestMode hrtf_appreq = Hrtf_Default;
-    ALCenum gainLimiter = device->Limiter ? ALC_TRUE : ALC_FALSE;
+    ALCenum gainLimiter = device->LimiterState;
     const ALsizei old_sends = device->NumAuxSends;
     ALsizei new_sends = device->NumAuxSends;
     enum DevFmtChannels oldChans;
@@ -2215,7 +2146,7 @@ static ALCenum UpdateDeviceParams(ALCdevice *device, const ALCint *attrList)
 
         if(depth > 0)
         {
-            depth = clampi(depth, 2, 20);
+            depth = clampi(depth, 2, 24);
             device->DitherDepth = powf(2.0f, (ALfloat)(depth-1));
         }
     }
@@ -2225,12 +2156,32 @@ static ALCenum UpdateDeviceParams(ALCdevice *device, const ALCint *attrList)
         TRACE("Dithering enabled (%g-bit, %g)\n", log2f(device->DitherDepth)+1.0f,
               device->DitherDepth);
 
+    device->LimiterState = gainLimiter;
     if(ConfigValueBool(alstr_get_cstr(device->DeviceName), NULL, "output-limiter", &val))
         gainLimiter = val ? ALC_TRUE : ALC_FALSE;
+
     /* Valid values for gainLimiter are ALC_DONT_CARE_SOFT, ALC_TRUE, and
-     * ALC_FALSE. We default to on, so ALC_DONT_CARE_SOFT is the same as
-     * ALC_TRUE.
+     * ALC_FALSE. For ALC_DONT_CARE_SOFT, use the limiter for integer-based
+     * output (where samples must be clamped), and don't for floating-point
+     * (which can take unclamped samples).
      */
+    if(gainLimiter == ALC_DONT_CARE_SOFT)
+    {
+        switch(device->FmtType)
+        {
+            case DevFmtByte:
+            case DevFmtUByte:
+            case DevFmtShort:
+            case DevFmtUShort:
+            case DevFmtInt:
+            case DevFmtUInt:
+                gainLimiter = ALC_TRUE;
+                break;
+            case DevFmtFloat:
+                gainLimiter = ALC_FALSE;
+                break;
+        }
+    }
     if(gainLimiter != ALC_FALSE)
     {
         ALfloat thrshld = 1.0f;
@@ -2254,8 +2205,8 @@ static ALCenum UpdateDeviceParams(ALCdevice *device, const ALCint *attrList)
 
         al_free(device->Limiter);
         device->Limiter = CreateDeviceLimiter(device, log10f(thrshld) * 20.0f);
-        device->FixedLatency += (ALuint)(device->Limiter->LookAhead * DEVICE_CLOCK_RES /
-                                         device->Frequency);
+        device->FixedLatency += (ALuint)(GetCompressorLookAhead(device->Limiter) *
+                                         DEVICE_CLOCK_RES / device->Frequency);
     }
     else
     {
@@ -2422,6 +2373,7 @@ static void InitDevice(ALCdevice *device, enum DeviceType type)
     device->Flags = 0;
     device->Render_Mode = NormalRender;
     device->AvgSpeakerDist = 0.0f;
+    device->LimiterState = ALC_DONT_CARE_SOFT;
 
     ATOMIC_INIT(&device->ContextList, NULL);
 
@@ -2856,6 +2808,11 @@ static bool ReleaseContext(ALCcontext *context, ALCdevice *device)
     else
         ret = !!newhead;
     V0(device->Backend,unlock)();
+
+    /* Make sure the context is finished and no longer processing in the mixer
+     * before sending the message queue kill event. The backend's lock does
+     * this, although waiting for a non-odd mix count would work too.
+     */
 
     while(ll_ringbuffer_write(context->AsyncEvents, (const char*)&kill_evt, 1) == 0)
         althrd_yield();
@@ -4096,6 +4053,7 @@ ALC_API ALCdevice* ALC_APIENTRY alcOpenDevice(const ALCchar *deviceName)
     device->IsHeadphones = AL_FALSE;
     device->AmbiLayout = AmbiLayout_Default;
     device->AmbiScale = AmbiNorm_Default;
+    device->LimiterState = ALC_TRUE;
     device->NumUpdates = 3;
     device->UpdateSize = 1024;
 
@@ -4233,8 +4191,6 @@ ALC_API ALCdevice* ALC_APIENTRY alcOpenDevice(const ALCchar *deviceName)
         else
             ERR("Unsupported ambi-format: %s\n", fmt);
     }
-
-    device->Limiter = CreateDeviceLimiter(device, 0.0f);
 
     {
         ALCdevice *head = ATOMIC_LOAD_SEQ(&DeviceList);
@@ -4562,8 +4518,6 @@ ALC_API ALCdevice* ALC_APIENTRY alcLoopbackOpenDeviceSOFT(const ALCchar *deviceN
 
     // Open the "backend"
     V(device->Backend,open)("Loopback");
-
-    device->Limiter = CreateDeviceLimiter(device, 0.0f);
 
     {
         ALCdevice *head = ATOMIC_LOAD_SEQ(&DeviceList);
