@@ -234,7 +234,9 @@
 // #define HAVE_PTHREAD_MUTEXATTR_SETKIND_NP
 
 /* Define if we have pthread_mutex_timedlock() */
-// #define HAVE_PTHREAD_MUTEX_TIMEDLOCK
+#ifndef HAVE_PTHREAD_MUTEX_TIMEDLOCK
+#define HAVE_PTHREAD_MUTEX_TIMEDLOCK 1
+#endif
 
 #ifndef HAVE_STRUCT_TIMESPEC
 #define HAVE_STRUCT_TIMESPEC 1
