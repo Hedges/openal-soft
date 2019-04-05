@@ -19,6 +19,8 @@
  */
 
 
+#include <switch.h>
+
 #include "config.h"
 
 #include <stdlib.h>
